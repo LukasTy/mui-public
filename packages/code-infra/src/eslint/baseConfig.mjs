@@ -70,6 +70,9 @@ export function createBaseConfig({
               ...globals.browser,
               ...globals.node,
             },
+            parserOptions: {
+              tsconfigRootDir: baseDirectory,
+            }
           },
           plugins: {
             mui: muiPlugin,
