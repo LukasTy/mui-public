@@ -1,20 +1,17 @@
 /* eslint-disable no-console */
 import { execaCommand } from 'execa';
 import timers from 'node:timers/promises';
-import { parse } from 'node-html-parser';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import chalk from 'chalk';
 import { Transform } from 'node:stream';
-import contentType from 'content-type';
-import { unified } from 'unified';
-import remarkParse from 'remark-parse';
-import remarkGfm from 'remark-gfm';
-import remarkRehype from 'remark-rehype';
-import rehypeSlug from 'rehype-slug';
-import rehypeStringify from 'rehype-stringify';
+import { Worker } from 'node:worker_threads';
 
 const DEFAULT_CONCURRENCY = 4;
+const SERVER_START_TIMEOUT = 10000;
+
+const crawlWorkerUrl = new URL('./crawlWorker.mjs', import.meta.url);
 
 /**
  * Creates a Transform stream that prefixes each line with a given string.
@@ -106,6 +103,30 @@ function deserializeLinkStructure(data) {
 }
 
 /**
+ * Input data passed to the crawl worker via workerData.
+ * @typedef {Object} CrawlWorkerInput
+ * @property {string} pageUrl - The page URL to crawl
+ * @property {ResolvedCrawlOptions} options - Fully resolved crawl options
+ */
+
+/**
+ * Serialized page data returned by the crawl worker (uses arrays instead of Sets for structured clone).
+ * @typedef {Object} CrawlWorkerPageData
+ * @property {string} url - The normalized page URL
+ * @property {number} status - HTTP status code
+ * @property {string[]} targets - Array of anchor targets (e.g., '#intro')
+ * @property {string} contentType - Content-type of the page
+ */
+
+/**
+ * Output message posted by the crawl worker.
+ * @typedef {Object} CrawlWorkerOutput
+ * @property {CrawlWorkerPageData} pageData - Serialized page data
+ * @property {Link[]} links - Links discovered on the page
+ * @property {{ pageUrl: string, results: import('html-validate').Result[] } | null} htmlValidateResults - HTML validation results, or null if validation was skipped/passed
+ */
+
+/**
  * Data about a crawled page including its URL, HTTP status, and available link targets.
  * @typedef {Object} PageData
  * @property {string} url - The normalized page URL (without trailing slash unless root)
@@ -129,77 +150,6 @@ async function writePagesToFile(pages, outPath) {
   const dir = path.dirname(outPath);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(outPath, JSON.stringify(fileContent, null, 2), 'utf-8');
-}
-
-/**
- * Computes the accessible name of an element according to ARIA rules.
- * Polyfill for `node.computedName` available only in Chrome v112+.
- * Checks in order: aria-label, aria-labelledby, label[for], img alt, innerText.
- * @param {import('node-html-parser').HTMLElement | null} elm - Element to compute name for
- * @param {import('node-html-parser').HTMLElement} ownerDocument - Document containing the element
- * @returns {string} The computed accessible name, or empty string if none found
- */
-function getAccessibleName(elm, ownerDocument) {
-  if (!elm) {
-    return '';
-  }
-
-  // 1. aria-label
-  const ariaLabel = elm.getAttribute('aria-label')?.trim();
-  if (ariaLabel) {
-    return ariaLabel;
-  }
-
-  // 2. aria-labelledby
-  const labelledby = elm.getAttribute('aria-labelledby');
-  if (labelledby) {
-    const labels = [];
-    for (const id of labelledby.split(/\s+/)) {
-      const label = getAccessibleName(ownerDocument.getElementById(id), ownerDocument);
-      if (label) {
-        labels.push(label);
-      }
-    }
-    const label = labels.join(' ').trim();
-    if (label) {
-      return label;
-    }
-  }
-
-  // 3. <label for="id">
-  if (elm.id) {
-    const label = ownerDocument.querySelector(`label[for="${elm.id}"]`);
-    if (label) {
-      return getAccessibleName(label, ownerDocument);
-    }
-  }
-
-  // 4. <img alt="">
-  if (elm.tagName === 'IMG') {
-    const alt = elm.getAttribute('alt')?.trim();
-    if (alt) {
-      return alt;
-    }
-  }
-
-  // 5. Fallback: visible text
-  return elm.innerText.trim();
-}
-
-/**
- * Converts markdown content to HTML using unified pipeline.
- * @param {string} markdown - Raw markdown content
- * @returns {Promise<string>} Converted HTML string
- */
-async function markdownToHtml(markdown) {
-  const result = await unified()
-    .use(remarkParse)
-    .use(remarkGfm)
-    .use(remarkRehype)
-    .use(rehypeSlug)
-    .use(rehypeStringify)
-    .process(markdown);
-  return String(result);
 }
 
 /**
@@ -402,11 +352,30 @@ function shouldIgnoreLink(link, ignores) {
  * @property {number} [concurrency] - Number of concurrent page fetches (defaults to 4)
  * @property {string[]} [seedUrls] - Starting URLs for the crawl (defaults to ['/'])
  * @property {IgnoreRule[]} [ignores] - Rules to ignore broken links. Each rule can have path, href, contentType, and/or has properties. All specified properties must match (AND logic). Within a property, multiple values use OR logic.
+ * @property {HtmlValidateOption} [htmlValidate] - Enable HTML validation on crawled pages. `false` (default): disabled. `true`: validate with recommended rules. Object: use as html-validate config — `mui:recommended` is always applied as the baseline, so most callers only need to set `rules`. Array: per-path config overrides — `mui:recommended` is applied once as the baseline and every entry whose `path` matches the page URL is layered on top; later matching entries win on conflicting rule keys. If an entry omits `extends`, it behaves like a rule patch and typically only changes the rules it names. If an entry includes `extends` (for example, re-extending `mui:recommended`), it can re-introduce or reset baseline presets rather than acting as a pure patch. An entry without `path` matches every page. If no entry matches, the page is not validated.
+ * @property {boolean} [verbose] - Log extra diagnostics during crawling (e.g. resolved html-validate config per page). Defaults to `false`.
+ */
+
+/**
+ * Per-page HTML validation override entry.
+ * @typedef {Object} HtmlValidateOverride
+ * @property {(string | RegExp) | (string | RegExp)[]} [path] - Pattern(s) to match the page URL. Strings use exact match. Omit to match every page.
+ * @property {true | import('html-validate').ConfigData} config - html-validate config (or `true` for `mui:recommended`).
+ */
+
+/**
+ * Public shape of the htmlValidate option.
+ * @typedef {boolean | import('html-validate').ConfigData | HtmlValidateOverride[]} HtmlValidateOption
+ */
+
+/**
+ * Resolved per-page HTML validation entry. Empty array means validation is disabled.
+ * @typedef {{ path: (string | RegExp)[] | undefined, config: import('html-validate').ConfigData }} ResolvedHtmlValidateEntry
  */
 
 /**
  * Fully resolved configuration with all optional fields filled with defaults.
- * @typedef {Omit<Required<CrawlOptions>, 'ignores'> & { ignores: NormalizedIgnoreRule[] }} ResolvedCrawlOptions
+ * @typedef {Omit<Required<CrawlOptions>, 'ignores' | 'htmlValidate'> & { ignores: NormalizedIgnoreRule[], htmlValidate: ResolvedHtmlValidateEntry[] }} ResolvedCrawlOptions
  */
 
 /**
@@ -420,6 +389,42 @@ function validateIgnoreRule(rule) {
       'Each ignore rule must have at least one property defined (path, href, or contentType)',
     );
   }
+}
+
+/**
+ * Normalizes a single config value to a non-null html-validate config object.
+ * Each config is registered as a pure rule patch; `mui:recommended` is pulled
+ * in once by the page's root config (ahead of every patch), so callers only
+ * need to specify the `rules` they want to change and never restate the
+ * recommended ruleset. `true` means "recommended only" (an empty patch). An
+ * explicit `extends` is still honored if a caller wants extra presets.
+ * @param {true | import('html-validate').ConfigData} config
+ * @returns {import('html-validate').ConfigData}
+ */
+function normalizeHtmlValidateConfig(config) {
+  if (config === true) {
+    return {};
+  }
+  return config;
+}
+
+/**
+ * Resolves the htmlValidate option into an array of per-page entries.
+ * An empty array means validation is disabled.
+ * @param {HtmlValidateOption | undefined} option
+ * @returns {ResolvedHtmlValidateEntry[]}
+ */
+function resolveHtmlValidateConfig(option) {
+  if (!option) {
+    return [];
+  }
+  if (option === true || !Array.isArray(option)) {
+    return [{ path: undefined, config: normalizeHtmlValidateConfig(option) }];
+  }
+  return option.map((entry) => ({
+    path: normalizeToArray(entry.path),
+    config: normalizeHtmlValidateConfig(entry.config),
+  }));
 }
 
 /**
@@ -447,6 +452,8 @@ function resolveOptions(rawOptions) {
     concurrency: rawOptions.concurrency ?? DEFAULT_CONCURRENCY,
     seedUrls: rawOptions.seedUrls ?? ['/'],
     ignores: normalizedIgnores,
+    htmlValidate: resolveHtmlValidateConfig(rawOptions.htmlValidate),
+    verbose: rawOptions.verbose ?? false,
   };
 }
 
@@ -506,10 +513,27 @@ async function resolveKnownTargets(options) {
 
 /**
  * Represents a broken link or broken link target discovered during crawling.
- * @typedef {Object} Issue
+ * @typedef {Object} BrokenLinkIssue
  * @property {'broken-link' | 'broken-target'} type - Type of issue: 'broken-link' for 404 pages, 'broken-target' for missing anchors
  * @property {string} message - Human-readable description of the issue (e.g., 'Target not found', 'Page returned error 404')
  * @property {Link} link - The link object that has the issue
+ */
+
+/**
+ * Represents an HTML validation issue found on a crawled page.
+ * @typedef {Object} HtmlValidateIssue
+ * @property {'html-validate'} type - Issue type discriminator
+ * @property {string} message - Human-readable description of the issue
+ * @property {string} pageUrl - The page URL where the issue was found
+ * @property {string} ruleId - The html-validate rule that triggered this issue (e.g., 'no-dup-id')
+ * @property {number} severity - Severity level (1 = warning, 2 = error)
+ * @property {{ line: number, column: number }} location - Source location of the issue
+ * @property {string | null} selector - DOM selector for the element, or null
+ */
+
+/**
+ * Any issue discovered during crawling.
+ * @typedef {BrokenLinkIssue | HtmlValidateIssue} Issue
  */
 
 /**
@@ -517,14 +541,14 @@ async function resolveKnownTargets(options) {
  * @typedef {Object} CrawlResult
  * @property {Set<Link>} links - All links discovered during the crawl
  * @property {Map<string, PageData>} pages - All pages crawled, keyed by normalized URL
- * @property {Issue[]} issues - All broken links and broken targets found
+ * @property {Issue[]} issues - All issues found (broken links, broken targets, and HTML validation issues)
  */
 
 /**
  * Reports broken links to stderr, grouped by source page for better readability.
- * @param {Issue[]} issuesList - Array of issues to report
+ * @param {BrokenLinkIssue[]} issuesList - Array of broken link issues to report
  */
-function reportIssues(issuesList) {
+function reportBrokenLinks(issuesList) {
   if (issuesList.length === 0) {
     return;
   }
@@ -532,7 +556,7 @@ function reportIssues(issuesList) {
   console.error('\nBroken links found:\n');
 
   // Group issues by source URL
-  /** @type {Map<string, Issue[]>} */
+  /** @type {Map<string, BrokenLinkIssue[]>} */
   const issuesBySource = new Map();
   for (const issue of issuesList) {
     const sourceUrl = issue.link.src ?? '(unknown)';
@@ -554,6 +578,39 @@ function reportIssues(issuesList) {
 }
 
 /**
+ * Reports HTML validation issues to stderr, grouped by page URL.
+ * @param {HtmlValidateIssue[]} htmlIssues - Array of HTML validation issues to report
+ */
+function reportHtmlValidation(htmlIssues) {
+  if (htmlIssues.length === 0) {
+    return;
+  }
+
+  console.error('\nHTML validation issues:\n');
+
+  // Group by page URL
+  /** @type {Map<string, HtmlValidateIssue[]>} */
+  const issuesByPage = new Map();
+  for (const issue of htmlIssues) {
+    const pageIssues = issuesByPage.get(issue.pageUrl) ?? [];
+    if (pageIssues.length === 0) {
+      issuesByPage.set(issue.pageUrl, pageIssues);
+    }
+    pageIssues.push(issue);
+  }
+
+  for (const [pageUrl, pageIssues] of issuesByPage.entries()) {
+    console.error(`Page ${chalk.cyan(pageUrl)}:`);
+    for (const issue of pageIssues) {
+      const severityLabel = issue.severity === 2 ? chalk.red('error') : chalk.yellow('warning');
+      console.error(
+        `  ${issue.location.line}:${issue.location.column}  ${severityLabel}  ${issue.message}  ${chalk.gray(issue.ruleId)}`,
+      );
+    }
+  }
+}
+
+/**
  * Crawls a website starting from seed URLs, discovering all internal links and checking for broken links/targets.
  * @param {CrawlOptions} rawOptions - Configuration options for the crawl
  * @returns {Promise<CrawlResult>} Crawl results including all links, pages, and issues found
@@ -564,36 +621,91 @@ export async function crawl(rawOptions) {
 
   /** @type {AbortController | null} */
   let controller = null;
-  if (options.startCommand) {
-    console.log(chalk.blue(`Starting server with "${options.startCommand}"...`));
-    controller = new AbortController();
-    const appProcess = execaCommand(options.startCommand, {
-      stdout: 'pipe',
-      stderr: 'pipe',
-      cancelSignal: controller.signal,
-      env: {
-        FORCE_COLOR: '1',
-        ...process.env,
-      },
-    });
 
-    // Prefix server logs
-    const serverPrefix = chalk.gray('server: ');
-    appProcess.stdout.pipe(prefixLines(serverPrefix)).pipe(process.stdout);
-    appProcess.stderr.pipe(prefixLines(serverPrefix)).pipe(process.stderr);
-    appProcess.catch(() => {});
+  try {
+    if (options.startCommand) {
+      console.log(chalk.blue(`Starting server with "${options.startCommand}"...`));
+      controller = new AbortController();
+      const appProcess = execaCommand(options.startCommand, {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        cancelSignal: controller.signal,
+        env: {
+          FORCE_COLOR: '1',
+          ...process.env,
+        },
+      });
 
-    await pollUrl(options.host, 10000);
+      // Prefix server logs
+      const serverPrefix = chalk.gray('server: ');
+      appProcess.stdout.pipe(prefixLines(serverPrefix)).pipe(process.stdout);
+      appProcess.stderr.pipe(prefixLines(serverPrefix)).pipe(process.stderr);
+      appProcess.catch(() => {});
 
-    console.log(`Server started on ${chalk.underline(options.host)}`);
+      // Poll the first page we are about to crawl (resolved against host) so we
+      // wait for the actual entry point to be serveable rather than the
+      // homepage, which may be a different (slower) page.
+      const healthcheckUrl = new URL(options.seedUrls[0] ?? '/', options.host).href;
+      await pollUrl(healthcheckUrl, SERVER_START_TIMEOUT);
+
+      console.log(`Server started on ${chalk.underline(options.host)}`);
+    }
+
+    return await runCrawl(options, startTime);
+  } finally {
+    // Always stop the server, even when startup or crawling throws. Without
+    // this, a failed healthcheck (or any error) would leave the dev server
+    // running, which on slow environments (e.g. Netlify) leads to orphaned
+    // servers piling up across retries.
+    if (controller) {
+      console.log(chalk.blue('Stopping server...'));
+      controller.abort();
+    }
   }
+}
 
+/**
+ * Runs the crawl against an already-running server.
+ * @param {ResolvedCrawlOptions} options - Fully resolved crawl options
+ * @param {number} startTime - Timestamp (ms) when the crawl began, for duration reporting
+ * @returns {Promise<CrawlResult>} Crawl results including all links, pages, and issues found
+ */
+async function runCrawl(options, startTime) {
   const knownTargets = await resolveKnownTargets(options);
 
   /** @type {Map<string, Promise<PageData>>} */
   const crawledPages = new Map();
   /** @type {Set<Link>} */
   const crawledLinks = new Set();
+  /** @type {Issue[]} */
+  const issues = [];
+  /**
+   * Spawns a crawl worker for a page URL.
+   * @param {string} pageUrl - The page URL to crawl
+   * @returns {Promise<{ pageData: PageData, links: Link[], htmlValidateResults: CrawlWorkerOutput['htmlValidateResults'] }>}
+   */
+  function crawlInWorker(pageUrl) {
+    return new Promise((resolve, reject) => {
+      /** @type {CrawlWorkerInput} */
+      const input = { pageUrl, options };
+      const worker = new Worker(crawlWorkerUrl, {
+        workerData: input,
+      });
+      worker.on('message', (/** @type {CrawlWorkerOutput} */ msg) => {
+        resolve({
+          pageData: {
+            url: msg.pageData.url,
+            status: msg.pageData.status,
+            targets: new Set(msg.pageData.targets),
+            contentType: msg.pageData.contentType,
+          },
+          links: msg.links,
+          htmlValidateResults: msg.htmlValidateResults,
+        });
+      });
+      worker.on('error', (err) => reject(err));
+    });
+  }
 
   const queue = new Queue(async (/** @type {Link} */ link) => {
     crawledLinks.add(link);
@@ -611,78 +723,30 @@ export async function crawl(rawOptions) {
       return;
     }
 
-    const pagePromise = Promise.resolve().then(async () => {
-      console.log(`Crawling ${chalk.cyan(pageUrl)}...`);
-      const res = await fetch(new URL(pageUrl, options.host));
-
-      const contentTypeHeader = res.headers.get('content-type');
-      let type = 'text/html';
-
-      if (contentTypeHeader) {
-        try {
-          const parsed = contentType.parse(contentTypeHeader);
-          type = parsed.type;
-        } catch {
-          console.warn(
-            chalk.yellow(`Warning: ${pageUrl} returned invalid content-type: ${contentTypeHeader}`),
-          );
+    console.log(`Crawling ${chalk.cyan(pageUrl)}...`);
+    const workerPromise = crawlInWorker(pageUrl);
+    const pagePromise = workerPromise.then((result) => {
+      if (result.htmlValidateResults) {
+        for (const validationResult of result.htmlValidateResults.results) {
+          for (const msg of validationResult.messages) {
+            issues.push({
+              type: 'html-validate',
+              message: msg.message,
+              pageUrl: result.htmlValidateResults.pageUrl,
+              ruleId: msg.ruleId,
+              severity: msg.severity,
+              location: { line: msg.line, column: msg.column },
+              selector: msg.selector,
+            });
+          }
         }
       }
 
-      /** @type {PageData} */
-      const pageData = {
-        url: pageUrl,
-        status: res.status,
-        targets: new Set(),
-        contentType: type,
-      };
-
-      if (pageData.status < 200 || pageData.status >= 400) {
-        console.warn(chalk.yellow(`Warning: ${pageUrl} returned status ${pageData.status}`));
-        return pageData;
+      for (const discoveredLink of result.links) {
+        queue.add(discoveredLink);
       }
 
-      if (type.startsWith('image/')) {
-        // Skip images
-        return pageData;
-      }
-
-      if (type !== 'text/html' && type !== 'text/markdown') {
-        console.warn(chalk.yellow(`Warning: ${pageUrl} returned non-HTML content-type: ${type}`));
-        return pageData;
-      }
-
-      const rawContent = await res.text();
-      const content = type === 'text/markdown' ? await markdownToHtml(rawContent) : rawContent;
-
-      const dom = parse(content, { parseNoneClosedTags: true });
-
-      let ignoredSelector = ':not(*)'; // matches nothing
-      if (options.ignoredContent.length > 0) {
-        ignoredSelector = Array.from(options.ignoredContent)
-          .flatMap((selector) => [selector, `${selector} *`])
-          .join(',');
-      }
-      const linksSelector = `a[href]:not(${ignoredSelector})`;
-
-      const pageLinks = dom.querySelectorAll(linksSelector).map((a) => ({
-        src: pageUrl,
-        text: getAccessibleName(a, dom),
-        href: a.getAttribute('href') ?? '',
-        contentType: type,
-      }));
-
-      for (const target of dom.querySelectorAll('*[id]')) {
-        if (!options.ignoredTargets.has(target.id)) {
-          pageData.targets.add(`#${target.id}`);
-        }
-      }
-
-      for (const pageLink of pageLinks) {
-        queue.add(pageLink);
-      }
-
-      return pageData;
+      return result.pageData;
     });
 
     crawledPages.set(pageUrl, pagePromise);
@@ -696,11 +760,6 @@ export async function crawl(rawOptions) {
 
   await queue.waitAll();
 
-  if (controller) {
-    console.log(chalk.blue('Stopping server...'));
-    controller.abort();
-  }
-
   const results = new Map(
     await Promise.all(
       Array.from(crawledPages.entries(), async ([a, b]) => /** @type {const} */ ([a, await b])),
@@ -710,10 +769,6 @@ export async function crawl(rawOptions) {
   if (options.outPath) {
     await writePagesToFile(results, options.outPath);
   }
-
-  /** Array to collect all issues found during validation */
-  /** @type {Issue[]} */
-  const issues = [];
 
   /** Count of links ignored due to ignores configuration */
   let ignoredCount = 0;
@@ -771,11 +826,24 @@ export async function crawl(rawOptions) {
     }
   }
 
-  reportIssues(issues);
+  // Split issues by type for reporting
+  /** @type {BrokenLinkIssue[]} */
+  const brokenLinkIssues = /** @type {BrokenLinkIssue[]} */ (
+    issues.filter((issue) => issue.type === 'broken-link' || issue.type === 'broken-target')
+  );
+  /** @type {HtmlValidateIssue[]} */
+  const htmlValidateIssues = /** @type {HtmlValidateIssue[]} */ (
+    issues.filter((issue) => issue.type === 'html-validate')
+  );
+
+  reportBrokenLinks(brokenLinkIssues);
+  reportHtmlValidation(htmlValidateIssues);
 
   // Derive counts from issues
-  const brokenLinks = issues.filter((issue) => issue.type === 'broken-link').length;
-  const brokenLinkTargets = issues.filter((issue) => issue.type === 'broken-target').length;
+  const brokenLinks = brokenLinkIssues.filter((issue) => issue.type === 'broken-link').length;
+  const brokenLinkTargets = brokenLinkIssues.filter(
+    (issue) => issue.type === 'broken-target',
+  ).length;
 
   const endTime = Date.now();
   const durationSeconds = (endTime - startTime) / 1000;
@@ -784,14 +852,21 @@ export async function crawl(rawOptions) {
     unit: 'second',
     maximumFractionDigits: 2,
   }).format(durationSeconds);
+  const fmt = new Intl.NumberFormat('en-US').format;
   console.log(chalk.blue(`\nCrawl completed in ${duration}`));
-  console.log(`  Total links found: ${chalk.cyan(crawledLinks.size)}`);
-  console.log(`  Total broken links: ${chalk.cyan(brokenLinks)}`);
-  console.log(`  Total broken link targets: ${chalk.cyan(brokenLinkTargets)}`);
-  console.log(`  Total ignored: ${chalk.cyan(ignoredCount)}`);
+  console.log(`  Total links found: ${chalk.cyan(fmt(crawledLinks.size))}`);
+  console.log(`  Total broken links: ${chalk.cyan(fmt(brokenLinks))}`);
+  console.log(`  Total broken link targets: ${chalk.cyan(fmt(brokenLinkTargets))}`);
+  console.log(`  Total ignored: ${chalk.cyan(fmt(ignoredCount))}`);
+  if (options.htmlValidate.length > 0) {
+    const pagesWithHtmlIssues = new Set(htmlValidateIssues.map((issue) => issue.pageUrl)).size;
+    console.log(
+      `  HTML validation issues: ${chalk.cyan(fmt(htmlValidateIssues.length))} across ${chalk.cyan(fmt(pagesWithHtmlIssues))} ${pagesWithHtmlIssues === 1 ? 'page' : 'pages'}`,
+    );
+  }
 
   if (options.outPath) {
-    console.log(chalk.blue(`Output written to: ${options.outPath}`));
+    console.log(chalk.blue(`Output written to: ${pathToFileURL(options.outPath)}`));
   }
 
   return { links: crawledLinks, pages: results, issues };

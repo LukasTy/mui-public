@@ -14,9 +14,8 @@ import Tooltip from '@mui/material/Tooltip';
 import type { WorkflowMetrics, PeriodSummary } from '../lib/ciAnalytics';
 import { formatDuration, formatSuccessRate } from '../lib/ciAnalytics';
 
-const WEEK_DAYS = 7;
-const MONTH_DAYS = 30;
 const THRESHOLD_PCT = 5;
+const HIGH_RUNTIME_DELTA = 20;
 const LOW_SUCCESS_RATE = 0.85;
 
 type MetricSeverity = 'error' | 'warning' | null;
@@ -33,9 +32,9 @@ export interface WorkflowAnalysis {
   runtimeDelta: number;
   runtimeDeltaSeverity: MetricSeverity;
 
-  creditsPerDay: number | null;
-  creditsDelta: number | null;
-  creditsDeltaSeverity: MetricSeverity;
+  creditsPerRun: number | null;
+  creditsPerRunDelta: number | null;
+  creditsPerRunDeltaSeverity: MetricSeverity;
 }
 
 function formatDelta(delta: number): string {
@@ -49,23 +48,19 @@ function getCircleCiInsightsUrl(slug: string, workflow: string): string {
   return `https://app.circleci.com/insights/github/${orgRepo}/workflows/${workflow}/overview?branch=master`;
 }
 
-function computeDeltas(
-  week: PeriodSummary,
-  month: PeriodSummary,
-  allBranchCredits?: { week: number; month: number },
-) {
+function computeDeltas(week: PeriodSummary, month: PeriodSummary) {
   const weekSuccessPct = week.successRate * 100;
   const monthSuccessPct = month.successRate * 100;
   const successDelta = weekSuccessPct - monthSuccessPct;
 
-  let creditsDelta: number | null = null;
-  let weekCreditsPerDay: number | null = null;
-  if (allBranchCredits) {
-    weekCreditsPerDay = allBranchCredits.week / WEEK_DAYS;
-    const monthCreditsPerDay = allBranchCredits.month / MONTH_DAYS;
-    creditsDelta =
-      monthCreditsPerDay > 0
-        ? ((weekCreditsPerDay - monthCreditsPerDay) / monthCreditsPerDay) * 100
+  let creditsPerRunDelta: number | null = null;
+  let weekCreditsPerRun: number | null = null;
+  if (week.totalRuns > 0 && month.totalRuns > 0) {
+    weekCreditsPerRun = week.totalCredits / week.totalRuns;
+    const monthCreditsPerRun = month.totalCredits / month.totalRuns;
+    creditsPerRunDelta =
+      monthCreditsPerRun > 0
+        ? ((weekCreditsPerRun - monthCreditsPerRun) / monthCreditsPerRun) * 100
         : 0;
   }
 
@@ -77,26 +72,34 @@ function computeDeltas(
       100;
   }
 
-  return { successDelta, runtimeDelta, creditsDelta, weekCreditsPerDay };
+  return { successDelta, runtimeDelta, creditsPerRunDelta, weekCreditsPerRun };
 }
 
 export function computeWorkflowAnalysis(wf: WorkflowMetrics): WorkflowAnalysis {
-  const { successDelta, runtimeDelta, creditsDelta, weekCreditsPerDay } = computeDeltas(
+  const { successDelta, runtimeDelta, creditsPerRunDelta, weekCreditsPerRun } = computeDeltas(
     wf.week,
     wf.month,
-    wf.allBranchCredits,
   );
 
   const successSeverity: MetricSeverity = wf.week.successRate < LOW_SUCCESS_RATE ? 'error' : null;
   const successDeltaSeverity: MetricSeverity = successDelta < -THRESHOLD_PCT ? 'error' : null;
-  const runtimeDeltaSeverity: MetricSeverity = runtimeDelta > THRESHOLD_PCT ? 'warning' : null;
-  const creditsDeltaSeverity: MetricSeverity =
-    creditsDelta != null && creditsDelta > THRESHOLD_PCT ? 'warning' : null;
+  let runtimeDeltaSeverity: MetricSeverity = null;
+  if (runtimeDelta > HIGH_RUNTIME_DELTA) {
+    runtimeDeltaSeverity = 'error';
+  } else if (runtimeDelta > THRESHOLD_PCT) {
+    runtimeDeltaSeverity = 'warning';
+  }
+  const creditsPerRunDeltaSeverity: MetricSeverity =
+    creditsPerRunDelta != null && creditsPerRunDelta > THRESHOLD_PCT ? 'warning' : null;
 
   let severity: MetricSeverity = null;
-  if (successSeverity === 'error' || successDeltaSeverity === 'error') {
+  if (
+    successSeverity === 'error' ||
+    successDeltaSeverity === 'error' ||
+    runtimeDeltaSeverity === 'error'
+  ) {
     severity = 'error';
-  } else if (runtimeDeltaSeverity === 'warning' || creditsDeltaSeverity === 'warning') {
+  } else if (runtimeDeltaSeverity === 'warning' || creditsPerRunDeltaSeverity === 'warning') {
     severity = 'warning';
   }
 
@@ -109,9 +112,9 @@ export function computeWorkflowAnalysis(wf: WorkflowMetrics): WorkflowAnalysis {
     runtimeSecs: wf.week.avgSuccessDurationSecs,
     runtimeDelta,
     runtimeDeltaSeverity,
-    creditsPerDay: weekCreditsPerDay,
-    creditsDelta,
-    creditsDeltaSeverity,
+    creditsPerRun: weekCreditsPerRun,
+    creditsPerRunDelta,
+    creditsPerRunDeltaSeverity,
   };
 }
 
@@ -198,7 +201,6 @@ export default function CiWorkflowCard({ slug, workflow }: CiWorkflowCardProps) 
         <Link
           href={getCircleCiInsightsUrl(slug, workflow.name)}
           target="_blank"
-          rel="noopener"
           underline="hover"
           variant="h6"
           sx={{ display: 'block', mb: 2 }}
@@ -228,22 +230,22 @@ export default function CiWorkflowCard({ slug, workflow }: CiWorkflowCardProps) 
             deltaSeverity={analysis.runtimeDeltaSeverity}
             invert
           />
-          {analysis.creditsDelta != null && analysis.creditsPerDay != null ? (
+          {analysis.creditsPerRunDelta != null && analysis.creditsPerRun != null ? (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
               <MetricRow
-                label="Credits/day"
-                value={Math.round(analysis.creditsPerDay).toLocaleString()}
+                label="Credits/run"
+                value={Math.round(analysis.creditsPerRun).toLocaleString()}
                 valueSeverity={null}
-                valueTooltip={`Credits/day: ${Math.round(analysis.creditsPerDay).toLocaleString()}`}
-                delta={analysis.creditsDelta}
-                deltaSeverity={analysis.creditsDeltaSeverity}
+                valueTooltip={`Credits/run (master): ${Math.round(analysis.creditsPerRun).toLocaleString()}`}
+                delta={analysis.creditsPerRunDelta}
+                deltaSeverity={analysis.creditsPerRunDeltaSeverity}
                 invert
               />
             </Box>
           ) : (
             <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 1 }}>
               <Typography variant="body2" color="text.secondary" sx={{ minWidth: 100 }}>
-                Credits/day
+                Credits/run
               </Typography>
               <Typography variant="body2" color="text.disabled" sx={{ fontStyle: 'italic' }}>
                 Insufficient data

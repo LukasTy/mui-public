@@ -5,39 +5,21 @@ import Typography from '@mui/material/Typography';
 import Autocomplete from '@mui/material/Autocomplete';
 import TextField from '@mui/material/TextField';
 import Button from '@mui/material/Button';
-import { styled } from '@mui/material/styles';
 import { LineChart } from '@mui/x-charts-pro/LineChart';
 import { byteSizeFormatter } from './SizeChangeDisplay';
-import { useDailyCommitHistory, DailyCommitData } from '../hooks/useDailyCommitHistory';
+import { useMasterCommits, type GitHubCommit } from '../hooks/useMasterCommits';
+import { useCiReports } from '../hooks/useCiReports';
 import ErrorDisplay from './ErrorDisplay';
+import { CHART_COLORS } from './chartColors';
+import { ToggleSelectButton } from './ToggleSelectButton';
 
-// Color palette for different bundle series
-const CHART_COLORS = [
-  '#1976d2', // Blue
-  '#d32f2f', // Red
-  '#2e7d32', // Green
-  '#ed6c02', // Orange
-  '#9c27b0', // Purple
-  '#00796b', // Teal
-  '#f57c00', // Amber
-  '#5d4037', // Brown
-];
+type SizeSnapshot = Record<string, { parsed: number; gzip: number }>;
 
-/**
- * Styled toggle button for chart controls
- */
-const ToggleSelectButton = styled(Button)(({ theme }) => ({
-  minWidth: 'auto',
-  padding: 0,
-  fontSize: '0.75rem',
-  textDecoration: 'underline',
-  color: theme.vars.palette.primary.main,
-  textTransform: 'none',
-  '&:disabled': {
-    color: theme.vars.palette.text.secondary,
-    textDecoration: 'none',
-  },
-}));
+interface DailyCommitData {
+  timestamp: number;
+  commit: GitHubCommit;
+  snapshot: SizeSnapshot | null;
+}
 
 /**
  * Determines if a bundle name represents a top-level package
@@ -57,6 +39,7 @@ interface DailyBundleSizeChartProps {
 }
 
 type SizeType = 'gzip' | 'parsed';
+const MIN_AUTO_Y_AXIS_RANGE = 1024;
 
 interface ChartData {
   dates: Date[];
@@ -76,7 +59,7 @@ function transformDataForChart(
     return { dates: [], series: [] };
   }
 
-  const dates = dailyData.map(({ date }) => new Date(date));
+  const dates = dailyData.map(({ timestamp }) => new Date(timestamp));
 
   const series = allBundles.map((bundleName, index) => ({
     label: bundleName,
@@ -93,8 +76,19 @@ function transformDataForChart(
 }
 
 export default function DailyBundleSizeChart({ repo }: DailyBundleSizeChartProps) {
-  const { dailyData, isLoading, isFetchingNextPage, hasNextPage, error, fetchNextPage } =
-    useDailyCommitHistory(repo);
+  const { commits, isLoading, isFetchingNextPage, hasNextPage, error, fetchNextPage } =
+    useMasterCommits(repo, { groupByDay: true });
+  const { reports, isLoading: reportsLoading } = useCiReports(repo, commits, 'size-snapshot.json');
+
+  const dailyData: DailyCommitData[] = React.useMemo(
+    () =>
+      commits.map(({ timestamp, commit }) => ({
+        timestamp,
+        commit,
+        snapshot: reports[commit.sha] ?? null,
+      })),
+    [commits, reports],
+  );
 
   const [selectedBundles, setSelectedBundles] = React.useState<string[]>([]);
   const [sizeType, setSizeType] = React.useState<SizeType>('gzip');
@@ -108,11 +102,14 @@ export default function DailyBundleSizeChart({ repo }: DailyBundleSizeChartProps
     return Array.from(bundleNames).sort();
   }, [dailyData]);
 
-  // Initialize selected bundles with top-level packages when data loads
-  React.useEffect(() => {
-    const topLevelBundles = allBundles.filter(isPackageTopLevel);
-    setSelectedBundles(topLevelBundles);
-  }, [allBundles]);
+  // Re-seed the selected bundles with the top-level packages whenever the available
+  // bundle set changes, tracked by comparing the previous `allBundles` reference during
+  // render so the reset lands in the same commit.
+  const [prevAllBundles, setPrevAllBundles] = React.useState<string[] | null>(null);
+  if (prevAllBundles !== allBundles) {
+    setPrevAllBundles(allBundles);
+    setSelectedBundles(allBundles.filter(isPackageTopLevel));
+  }
 
   const chartData = transformDataForChart(dailyData, sizeType, allBundles);
 
@@ -146,7 +143,7 @@ export default function DailyBundleSizeChart({ repo }: DailyBundleSizeChartProps
               filterSelectedOptions
               size="small"
               renderInput={(params) => (
-                <TextField {...params} placeholder="Search and select bundles..." />
+                <TextField {...params} placeholder="Search and select bundles…" />
               )}
               sx={{ mb: 1 }}
             />
@@ -212,19 +209,27 @@ export default function DailyBundleSizeChart({ repo }: DailyBundleSizeChartProps
                     if (context.location === 'tick') {
                       return date.toLocaleDateString();
                     }
-                    // For tooltip, find the corresponding commit data
-                    const dateString = date.toISOString().split('T')[0];
-                    const dataPoint = dailyData.find((d) => d.date === dateString);
+                    const dataPoint = dailyData.find((item) => item.timestamp === date.getTime());
                     const commitSha = dataPoint?.commit?.sha?.substring(0, 7) || '';
                     return commitSha
-                      ? `${date.toLocaleDateString()} (${commitSha})`
-                      : date.toLocaleDateString();
+                      ? `${date.toLocaleString()} (${commitSha})`
+                      : date.toLocaleString();
                   },
                 },
               ]}
               yAxis={[
                 {
-                  ...(yAxisStartAtZero && { min: 0 }),
+                  domainLimit: (minValue, maxValue) => {
+                    const dataMin = yAxisStartAtZero ? 0 : Number(minValue);
+                    const dataMax = Number(maxValue);
+                    const deficit = Math.max(0, MIN_AUTO_Y_AXIS_RANGE - (dataMax - dataMin));
+                    const padBelow = yAxisStartAtZero ? 0 : deficit / 2;
+                    const padAbove = deficit - padBelow;
+                    return {
+                      min: Math.max(0, Math.floor((dataMin - padBelow) / 1024) * 1024),
+                      max: Math.ceil((dataMax + padAbove) / 1024) * 1024,
+                    };
+                  },
                   width: 60,
                   valueFormatter: (value: number) => byteSizeFormatter.format(value),
                 },
@@ -237,7 +242,7 @@ export default function DailyBundleSizeChart({ repo }: DailyBundleSizeChartProps
                 valueFormatter: (value: number | null) =>
                   value ? byteSizeFormatter.format(value) : 'No data',
               }))}
-              loading={isLoading}
+              loading={isLoading || reportsLoading}
               height={300}
               hideLegend
               grid={{ horizontal: true, vertical: true }}

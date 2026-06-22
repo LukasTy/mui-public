@@ -73,9 +73,18 @@ export default function InspectPackage() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const pathname = usePathname();
-  const [packageInput, setPackageInput] = React.useState(searchParams.get('package') || '');
-
   const packageSpec = searchParams.get('package');
+
+  const [packageInput, setPackageInput] = React.useState(packageSpec || '');
+
+  // Re-seed the locally-editable input from the URL when the ?package= value
+  // changes for a reason other than typing (e.g. back/forward navigation or an
+  // external link), by comparing the previous value during render.
+  const [prevPackageSpec, setPrevPackageSpec] = React.useState(packageSpec);
+  if (prevPackageSpec !== packageSpec) {
+    setPrevPackageSpec(packageSpec);
+    setPackageInput(packageSpec || '');
+  }
 
   const pkgQuery = usePackageContent(packageSpec);
   const loading = pkgQuery.isLoading;
@@ -93,15 +102,10 @@ export default function InspectPackage() {
     router.replace(`${pathname}?${params.toString()}`);
   });
 
-  // Sync input field with URL parameter when it changes
-  React.useEffect(() => {
-    setPackageInput(searchParams.get('package') || '');
-  }, [searchParams]);
-
   return (
     <Box sx={{ mt: 4, display: 'flex', flexDirection: 'column', gap: 4 }}>
       <Box>
-        <Heading level={1}>Inspect Package</Heading>
+        <Heading level={1}>npm package inspector</Heading>
         <Box
           component="form"
           onSubmit={(event: React.FormEvent) => {
@@ -136,7 +140,6 @@ export default function InspectPackage() {
               },
             }}
           />
-
           <Button
             type="submit"
             variant="contained"
@@ -163,7 +166,6 @@ export default function InspectPackage() {
           </Button>
         </Box>
       </Box>
-
       <PackageContent pkg={pkgQuery.data} loading={pkgQuery.isLoading} />
     </Box>
   );

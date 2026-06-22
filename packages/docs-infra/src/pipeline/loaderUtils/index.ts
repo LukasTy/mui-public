@@ -7,3 +7,4 @@ export * from './extractNameAndSlugFromUrl';
 export * from './externalsToPackages';
 export * from './fileUrlToPortablePath';
 export * from './getLanguageFromExtension';
+export * from './generateFileSlug';

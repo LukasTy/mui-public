@@ -5,12 +5,45 @@ import * as React from 'react';
 import type { ContentProps } from '@mui/internal-docs-infra/CodeHighlighter/types';
 import { useCode } from '@mui/internal-docs-infra/useCode';
 
+import { CodeActionsMenu } from '../../../../../docs-infra/components/code-highlighter/demos/CodeActionsMenu';
+import {
+  CodeBlockHeader,
+  CodeBlockHeaderLabel,
+} from '../../../../../docs-infra/components/code-highlighter/demos/CodeBlockHeader';
 import styles from './CodeContent.module.css';
 
-import '@wooorm/starry-night/style/light';
+import '../../../../../docs-infra/components/code-highlighter/demos/syntax.css';
 
 export function CodeContent(props: ContentProps<{}>) {
+  // @focus-start @padding 1
   const code = useCode(props, { preClassName: styles.codeBlock });
 
-  return <div className={styles.code}>{code.selectedFile}</div>;
+  return (
+    <div>
+      {code.allFilesSlugs.map(({ slug }) => (
+        <span key={slug} id={slug} className={styles.fileRefs} />
+      ))}
+      <div className={styles.container}>
+        <CodeBlockHeader
+          roundedTop
+          pending={code.pendingTransform}
+          menu={
+            <CodeActionsMenu
+              inline
+              onCopy={code.copy}
+              fileUrl={code.selectedFileUrl}
+              fileName={code.selectedFileName}
+              fileSlug={code.selectedFileSlug}
+            />
+          }
+        >
+          {code.selectedFileName ? (
+            <CodeBlockHeaderLabel>{code.selectedFileName}</CodeBlockHeaderLabel>
+          ) : null}
+        </CodeBlockHeader>
+        <div className={styles.code}>{code.selectedFile}</div>
+      </div>
+    </div>
+  );
+  // @focus-end
 }

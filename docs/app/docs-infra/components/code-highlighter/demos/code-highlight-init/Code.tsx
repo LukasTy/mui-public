@@ -10,13 +10,15 @@ const sourceParser = createParseSource();
 
 export function Code({ children, fileName }: { children: string; fileName?: string }) {
   return (
+    // @focus-start
     <CodeHighlighter
       fileName={fileName}
       Content={CodeContent}
       sourceParser={sourceParser}
-      highlightAfter="idle"
+      highlightAfter="init"
     >
       {children}
     </CodeHighlighter>
+    // @focus-end
   );
 }

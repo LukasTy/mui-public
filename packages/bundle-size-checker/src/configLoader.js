@@ -2,11 +2,12 @@
  * Utility to load the bundle-size-checker configuration
  */
 
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import envCi from 'env-ci';
 import * as module from 'node:module';
 import * as url from 'node:url';
+import micromatch from 'micromatch';
+import { findExportedPaths } from './findExportedPaths.js';
 
 /**
  * @typedef {import('./types.js').BundleSizeCheckerConfigObject} BundleSizeCheckerConfigObject
@@ -80,11 +81,8 @@ export function applyUploadConfigDefaults(uploadConfig, ciInfo) {
     throw new Error('Missing required field: upload.branch. Please specify a branch name.');
   }
 
-  const legacyUpload = uploadConfig.legacyUpload ?? false;
   const apiUrl =
-    uploadConfig.apiUrl ||
-    process.env.CI_REPORT_API_URL ||
-    'https://code-infra-dashboard.onrender.com';
+    uploadConfig.apiUrl || process.env.CI_REPORT_API_URL || 'https://frontend-public.mui.com';
 
   // Return the normalized config
   /** @type {NormalizedUploadConfig} */
@@ -96,7 +94,6 @@ export function applyUploadConfigDefaults(uploadConfig, ciInfo) {
         ? Boolean(uploadConfig.isPullRequest)
         : Boolean(isPr),
     apiUrl,
-    legacyUpload,
   };
 
   // Add PR number from CI environment if available
@@ -105,36 +102,6 @@ export function applyUploadConfigDefaults(uploadConfig, ciInfo) {
   }
 
   return result;
-}
-
-/**
- * @param {{ [s: string]: any; } | ArrayLike<any>} exportsObj
- * @returns {string[]} Array of export paths
- */
-function findExports(exportsObj) {
-  const paths = [];
-  for (const [key, value] of Object.entries(exportsObj)) {
-    // ignore null values
-    if (!value) {
-      continue;
-    }
-    if (key.startsWith('.')) {
-      paths.push(key);
-    } else {
-      paths.push(...findExports(value));
-    }
-  }
-  return paths;
-}
-
-/**
- * @param {import("fs").PathLike | fs.FileHandle} pkgJson
- * @returns {Promise<string[]>}
- */
-async function findExportedPaths(pkgJson) {
-  const pkgContent = await fs.readFile(pkgJson, 'utf8');
-  const { exports = {} } = JSON.parse(pkgContent);
-  return findExports(exports);
 }
 
 /**
@@ -198,8 +165,18 @@ async function normalizeEntries(entries, configPath) {
           }
           const exportedPaths = await findExportedPaths(pkgJson);
 
+          const excludePatterns =
+            typeof entry.expand === 'object' && entry.expand.exclude ? entry.expand.exclude : [];
+
           const expandedEntries = [];
           for (const exportPath of exportedPaths) {
+            if (exportPath === './package.json') {
+              continue;
+            }
+            const subpath = exportPath === '.' ? '.' : exportPath.slice(2);
+            if (excludePatterns.length > 0 && micromatch.isMatch(subpath, excludePatterns)) {
+              continue;
+            }
             const importSrc = entry.import + exportPath.slice(1);
             expandedEntries.push({
               id: importSrc,
@@ -216,6 +193,11 @@ async function normalizeEntries(entries, configPath) {
   ).flat();
 
   for (const entry of result) {
+    if (entry.id.startsWith('_')) {
+      throw new Error(
+        `Entry id "${entry.id}" must not start with "_". Ids starting with "_" are reserved for internal metadata.`,
+      );
+    }
     if (usedIds.has(entry.id)) {
       throw new Error(`Duplicate entry id found: "${entry.id}". Entry ids must be unique.`);
     }

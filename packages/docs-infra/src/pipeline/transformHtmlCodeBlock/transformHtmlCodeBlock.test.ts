@@ -3,46 +3,106 @@ import { unified } from 'unified';
 import rehypeParse from 'rehype-parse';
 import remarkParse from 'remark-parse';
 import remarkRehype from 'remark-rehype';
+import type { Element } from 'hast';
 import { transformHtmlCodeBlock } from './transformHtmlCodeBlock';
+import type { TransformHtmlCodeBlockOptions } from './transformHtmlCodeBlock';
 import { transformMarkdownCode } from '../transformMarkdownCode/transformMarkdownCode';
-import type { VariantCode } from '../../CodeHighlighter/types';
+import { loadIsomorphicCodeVariant } from '../loadIsomorphicCodeVariant/loadIsomorphicCodeVariant';
+import type { SourceEnhancers, VariantCode } from '../../CodeHighlighter/types';
 
-// Mock the loadCodeVariant function
-vi.mock('../loadCodeVariant/loadCodeVariant', () => ({
-  loadCodeVariant: vi.fn(async (url: string, variantName: string, variant: VariantCode) => {
-    // Import normalizeLanguage inside the mock to apply normalization
-    const { normalizeLanguage: normalize } =
-      await import('../loaderUtils/getLanguageFromExtension');
+// Mock the loadIsomorphicCodeVariant function
+vi.mock('../loadIsomorphicCodeVariant/loadIsomorphicCodeVariant', () => ({
+  loadIsomorphicCodeVariant: vi.fn(
+    async (url: string, variantName: string, variant: VariantCode) => {
+      // Import normalizeLanguage inside the mock to apply normalization
+      const { normalizeLanguage: normalize } =
+        await import('../loaderUtils/getLanguageFromExtension');
 
-    // Simple mock that just returns the input with some transforms applied
-    // Also normalize language like the real implementation does
-    const normalizedLanguage = variant.language ? normalize(variant.language) : undefined;
+      // Simple mock that just returns the input with some transforms applied
+      // Also normalize language like the real implementation does
+      const normalizedLanguage = variant.language ? normalize(variant.language) : undefined;
 
-    return {
-      code: {
-        ...variant,
-        language: normalizedLanguage,
-        transforms: { 'mock-transform': { delta: {}, fileName: 'mock.js' } },
-      },
-      dependencies: [url],
-    };
-  }),
+      return {
+        code: {
+          ...variant,
+          language: normalizedLanguage,
+          transforms: { 'mock-transform': { delta: {}, fileName: 'mock.js' } },
+        },
+        dependencies: [url],
+      };
+    },
+  ),
 }));
 
 describe('transformHtmlCodeBlock', () => {
-  const getAstFromHtml = async (html: string) => {
-    const processor = unified().use(rehypeParse, { fragment: true }).use(transformHtmlCodeBlock);
+  const hasClassName = (
+    node: { properties?: { className?: string | string[] } },
+    className: string,
+  ) => {
+    const nodeClassName = node.properties?.className;
+
+    if (Array.isArray(nodeClassName)) {
+      return nodeClassName.includes(className);
+    }
+
+    return nodeClassName === className;
+  };
+
+  const applySourceEnhancers = async (
+    variant: VariantCode,
+    sourceEnhancers: SourceEnhancers | undefined,
+    fileName: string,
+    parser:
+      | Promise<(source: string, fileName: string, language?: string) => any>
+      | ((source: string, fileName: string, language?: string) => any)
+      | undefined,
+  ) => {
+    if (!parser || !variant.source || typeof variant.source !== 'string') {
+      return variant.source;
+    }
+
+    const parseSource = await parser;
+    let parsedSource = parseSource(variant.source, fileName, variant.language);
+    if (!sourceEnhancers || sourceEnhancers.length === 0) {
+      return parsedSource;
+    }
+
+    // `variant.comments` are already 1-indexed (the stored `Code` convention), matching the
+    // real loader which no longer converts.
+    const comments = variant.comments;
+    parsedSource = await sourceEnhancers.reduce(
+      async (accPromise, enhancer) => enhancer(await accPromise, comments, fileName),
+      Promise.resolve(parsedSource),
+    );
+
+    return parsedSource;
+  };
+
+  const getFrameElements = (source: { children?: any[] }) =>
+    (source.children ?? []).filter(
+      (child): child is Element => child?.type === 'element' && hasClassName(child, 'frame'),
+    );
+
+  const countFrameLines = (frame: Element) =>
+    frame.children.filter(
+      (child): child is Element => child.type === 'element' && hasClassName(child, 'line'),
+    ).length;
+
+  const getAstFromHtml = async (html: string, options?: TransformHtmlCodeBlockOptions) => {
+    const processor = unified()
+      .use(rehypeParse, { fragment: true })
+      .use(transformHtmlCodeBlock, options);
     const tree = await processor.run(processor.parse(html));
     return tree as any;
   };
 
   // More realistic test that mimics Next.js MDX processing pipeline
-  const getAstFromMarkdown = async (markdown: string) => {
+  const getAstFromMarkdown = async (markdown: string, options?: TransformHtmlCodeBlockOptions) => {
     const processor = unified()
       .use(remarkParse) // Parse markdown
       .use(transformMarkdownCode) // Convert markdown code blocks to semantic HTML
       .use(remarkRehype, { allowDangerousHtml: true }) // Convert markdown to HTML AST
-      .use(transformHtmlCodeBlock); // Apply our rehype plugin
+      .use(transformHtmlCodeBlock, options); // Apply our rehype plugin
 
     const tree = await processor.run(processor.parse(markdown));
     return tree as any;
@@ -445,6 +505,31 @@ console.log(msg);
     expect(userProps.highlight).toBe('2-3');
   });
 
+  it('should serialize code block display flags as boolean content props', async () => {
+    const html =
+      '<pre><code class="language-typescript" data-collapse-to-empty="false" data-initial-expanded>const x = 1;</code></pre>';
+    const ast = await getAstFromHtml(html);
+
+    const preElement = findPreElement(ast);
+    expect(preElement.properties?.dataContentProps).toBeTruthy();
+
+    const userProps = JSON.parse(preElement.properties.dataContentProps);
+    expect(userProps.collapseToEmpty).toBe(false);
+    expect(userProps.initialExpanded).toBe(true);
+  });
+
+  it('should serialize transform default display flags as boolean content props', async () => {
+    const html = '<pre><code class="language-typescript">const x = 1;</code></pre>';
+    const ast = await getAstFromHtml(html, { collapseToEmpty: true, initialExpanded: true });
+
+    const preElement = findPreElement(ast);
+    expect(preElement.properties?.dataContentProps).toBeTruthy();
+
+    const userProps = JSON.parse(preElement.properties.dataContentProps);
+    expect(userProps.collapseToEmpty).toBe(true);
+    expect(userProps.initialExpanded).toBe(true);
+  });
+
   it('should not include reserved data props in userProps', async () => {
     const html =
       '<pre><code class="language-typescript" data-filename="test.ts" data-variant="main" data-transform="true" data-title="My Title">const x = 1;</code></pre>';
@@ -519,7 +604,153 @@ const x = 1; // @highlight
     const precomputeData = JSON.parse(preElement.properties.dataPrecompute);
     // Comments should still be collected for the enhancer
     expect(precomputeData.Default.comments).toBeDefined();
-    expect(precomputeData.Default.comments['0']).toContain('@highlight');
+    expect(precomputeData.Default.comments['1']).toContain('@highlight');
+  });
+
+  function mockLoadIsomorphicCodeVariantWithEnhancers() {
+    vi.mocked(loadIsomorphicCodeVariant).mockImplementationOnce(
+      async (
+        _url: string | undefined,
+        _variantName: string,
+        variant: string | VariantCode | undefined,
+        options?: any,
+      ) => {
+        if (!variant || typeof variant === 'string' || !options) {
+          throw new Error('Expected transformHtmlCodeBlock to pass a variant object and options');
+        }
+
+        const fileName = variant.fileName ?? 'code.js';
+        const source = await applySourceEnhancers(
+          variant,
+          options.sourceEnhancers,
+          fileName,
+          options.sourceParser,
+        );
+
+        return {
+          code: {
+            ...variant,
+            source,
+          },
+          dependencies: [],
+          externals: {},
+        };
+      },
+    );
+  }
+
+  it('should use 25 lines of context padding by default for authored page code blocks', async () => {
+    mockLoadIsomorphicCodeVariantWithEnhancers();
+
+    const codeLines = Array.from({ length: 90 }, (_, index) => {
+      if (index === 39) {
+        return `const line${index + 1} = ${index + 1}; // @highlight`;
+      }
+
+      return `const line${index + 1} = ${index + 1};`;
+    }).join('\n');
+
+    const html = `<pre><code class="language-javascript">${codeLines}</code></pre>`;
+
+    const ast = await getAstFromHtml(html);
+    const preElement = findPreElement(ast);
+    expect(preElement).toBeTruthy();
+    const precomputeData = JSON.parse(preElement.properties.dataPrecompute);
+    const frames = getFrameElements(precomputeData.Default.source);
+
+    expect(frames).toHaveLength(5);
+    expect(frames[1].properties?.dataFrameType).toBe('padding-top');
+    expect(frames[2].properties?.dataFrameType).toBe('highlighted');
+    expect(frames[3].properties?.dataFrameType).toBe('padding-bottom');
+    expect(countFrameLines(frames[1])).toBe(25);
+    expect(countFrameLines(frames[2])).toBe(1);
+    expect(countFrameLines(frames[3])).toBe(25);
+  });
+
+  it('should cap focused regions at 60 lines by default for authored page code blocks', async () => {
+    mockLoadIsomorphicCodeVariantWithEnhancers();
+
+    const codeLines = Array.from(
+      { length: 70 },
+      (_, index) => `const line${index + 1} = ${index + 1};`,
+    ).join('\n');
+
+    const html = `<pre><code class="language-javascript">// @highlight-start
+  ${codeLines}
+  // @highlight-end</code></pre>`;
+
+    const ast = await getAstFromHtml(html);
+    const preElement = findPreElement(ast);
+    expect(preElement).toBeTruthy();
+    const precomputeData = JSON.parse(preElement.properties.dataPrecompute);
+    const frames = getFrameElements(precomputeData.Default.source);
+
+    expect(frames).toHaveLength(2);
+    expect(frames[0].properties?.dataFrameType).toBe('highlighted');
+    expect(frames[0].properties?.dataFrameTruncated).toBe('visible');
+    expect(frames[1].properties?.dataFrameType).toBe('highlighted-unfocused');
+    expect(frames[1].properties?.dataFrameTruncated).toBe('hidden');
+    expect(countFrameLines(frames[0])).toBe(60);
+    expect(countFrameLines(frames[1])).toBe(10);
+  });
+
+  it('should allow overriding the default padding context via plugin options', async () => {
+    mockLoadIsomorphicCodeVariantWithEnhancers();
+
+    const codeLines = Array.from({ length: 90 }, (_, index) => {
+      if (index === 39) {
+        return `const line${index + 1} = ${index + 1}; // @highlight`;
+      }
+
+      return `const line${index + 1} = ${index + 1};`;
+    }).join('\n');
+
+    const html = `<pre><code class="language-javascript">${codeLines}</code></pre>`;
+
+    const ast = await getAstFromHtml(html, {
+      paddingFrameMaxSize: 5,
+    });
+    const preElement = findPreElement(ast);
+    expect(preElement).toBeTruthy();
+    const precomputeData = JSON.parse(preElement.properties.dataPrecompute);
+    const frames = getFrameElements(precomputeData.Default.source);
+
+    expect(frames).toHaveLength(5);
+    expect(frames[1].properties?.dataFrameType).toBe('padding-top');
+    expect(frames[2].properties?.dataFrameType).toBe('highlighted');
+    expect(frames[3].properties?.dataFrameType).toBe('padding-bottom');
+    expect(countFrameLines(frames[1])).toBe(5);
+    expect(countFrameLines(frames[2])).toBe(1);
+    expect(countFrameLines(frames[3])).toBe(5);
+  });
+
+  it('should allow overriding the default focus cap via plugin options', async () => {
+    mockLoadIsomorphicCodeVariantWithEnhancers();
+
+    const codeLines = Array.from(
+      { length: 70 },
+      (_, index) => `const line${index + 1} = ${index + 1};`,
+    ).join('\n');
+
+    const html = `<pre><code class="language-javascript">// @highlight-start
+  ${codeLines}
+  // @highlight-end</code></pre>`;
+
+    const ast = await getAstFromHtml(html, {
+      focusFramesMaxSize: 20,
+    });
+    const preElement = findPreElement(ast);
+    expect(preElement).toBeTruthy();
+    const precomputeData = JSON.parse(preElement.properties.dataPrecompute);
+    const frames = getFrameElements(precomputeData.Default.source);
+
+    expect(frames).toHaveLength(2);
+    expect(frames[0].properties?.dataFrameType).toBe('highlighted');
+    expect(frames[0].properties?.dataFrameTruncated).toBe('visible');
+    expect(frames[1].properties?.dataFrameType).toBe('highlighted-unfocused');
+    expect(frames[1].properties?.dataFrameTruncated).toBe('hidden');
+    expect(countFrameLines(frames[0])).toBe(20);
+    expect(countFrameLines(frames[1])).toBe(50);
   });
 
   it('should strip trailing semicolons from solo JSX expression lines in tsx', async () => {
@@ -568,6 +799,17 @@ const x = 1; // @highlight
 
   it('should strip JSX expression semicolons from basic pre > code without filename', async () => {
     const html = '<pre><code class="language-tsx">&lt;Component /&gt;;</code></pre>';
+    const ast = await getAstFromHtml(html);
+
+    const preElement = findPreElement(ast);
+    expect(preElement).toBeTruthy();
+
+    const precomputeData = JSON.parse(preElement.properties.dataPrecompute);
+    expect(precomputeData.Default.source).toBe('<Component />');
+  });
+
+  it('should strip JSX expression semicolons when followed by a trailing newline', async () => {
+    const html = '<pre><code class="language-tsx">&lt;Component /&gt;;\n</code></pre>';
     const ast = await getAstFromHtml(html);
 
     const preElement = findPreElement(ast);

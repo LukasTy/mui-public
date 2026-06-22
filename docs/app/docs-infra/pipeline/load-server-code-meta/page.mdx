@@ -113,23 +113,39 @@ const code = await customLoadCodeMeta('file:///path/to/demo/index.ts');
 
 Using with server-side rendering:
 
+Pass it as the `loadCodeMeta` function — `CodeHighlighter` calls it with the `url` itself, then loads each resolved variant with `loadSource`:
+
 ```tsx
 import { loadServerCodeMeta } from '@mui/internal-docs-infra/pipeline/loadServerCodeMeta';
+import { createLoadServerCodeSource } from '@mui/internal-docs-infra/pipeline/loadServerCodeSource';
+import { createParseSource } from '@mui/internal-docs-infra/pipeline/parseSource';
 import { CodeHighlighter } from '@mui/internal-docs-infra/CodeHighlighter';
+import { CodeContent } from './CodeContent';
 
-async function DemoPage() {
-  const code = await loadServerCodeMeta('file:///app/demos/example/index.ts');
+const loadSource = createLoadServerCodeSource();
+const sourceParser = createParseSource();
 
-  return <CodeHighlighter code={code} loadCodeMeta={loadServerCodeMeta} />;
+function DemoPage() {
+  return (
+    <CodeHighlighter
+      url="file:///app/demos/example/index.ts"
+      loadCodeMeta={loadServerCodeMeta}
+      loadSource={loadSource}
+      sourceParser={sourceParser}
+      Content={CodeContent}
+    />
+  );
 }
 ```
+
+More commonly, it is wired once into your `createDemo` factory (via [`abstractCreateDemo`](../../factories/abstract-create-demo/page.mdx)) so every server-loaded demo uses it automatically.
 
 ---
 
 ## How It Works
 
 1. **Read Demo File**: Reads the demo index file from the filesystem using `readFile`
-2. **Parse Factory Call**: Uses `parseCreateFactoryCall` to find `createDemo()` or `createDemoWithVariants()` calls
+2. **Parse Factory Call**: Uses [`parseCreateFactoryCall`](../parse-create-factory-call/page.mdx) to find `createDemo()` or `createDemoWithVariants()` calls
 3. **Extract Variants**: Extracts the variants object and any named export mappings
 4. **Resolve Paths**: Uses `resolveVariantPathsWithFs` to convert relative imports to absolute file URLs
 5. **Build Code Object**: Creates the final `Code` object with variant metadata
@@ -140,6 +156,8 @@ The function handles:
 - Named exports vs default exports
 - File path resolution with filesystem lookups
 - URL formatting with `file://` protocol
+
+If the file contains no `create*` call or no variants, the function returns an empty `Code` object rather than throwing.
 
 ---
 
@@ -167,7 +185,12 @@ import { TypesLoadServerCodeMeta } from './types';
 
 ## Related
 
-- [`loadCodeVariant`](../load-code-variant/page.mdx) - For loading individual variant metadata
-- [`loadServerSource`](../load-server-source/page.mdx) - For loading source code content
+- [`loadIsomorphicCodeVariant`](../load-isomorphic-code-variant/page.mdx) - For loading individual variant metadata
+- [`loadServerCodeSource`](../load-server-code-source/page.mdx) - For loading source code content
 - [`CodeHighlighter`](../../components/code-highlighter/page.mdx) - Uses this for server-side code loading
 - [`loadPrecomputedCodeHighlighter`](../load-precomputed-code-highlighter/page.mdx) - Build-time alternative
+
+export const metadata =
+  /** @type {import('@mui/internal-docs-infra/createSitemap/types').NextMetadata} */ ({
+    keywords: ['loadCodeMeta', 'variants', 'demo parsing', 'path resolution'],
+  });

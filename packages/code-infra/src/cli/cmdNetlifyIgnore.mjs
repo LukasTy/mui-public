@@ -6,111 +6,39 @@
  * @typedef {Object} Args
  * @property {string[]} workspaces - List of workspace names to process
  * @property {boolean} [check] - Check mode - error if the generated content differs from current
+ * @property {string} [baseBranch] - Branch to compare PRs against (default: master)
  */
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { findWorkspaceDir } from '@pnpm/find-workspace-dir';
 import { toPosixPath } from '../utils/path.mjs';
-import { getWorkspacePackages } from '../utils/pnpm.mjs';
+import { getTransitiveDependencies, getWorkspacePackages } from '../utils/pnpm.mjs';
 
 /**
- * Get all workspace dependencies (direct and transitive) from a package
- * @param {string} packageName - Package name
- * @param {Map<string, string>} workspaceMap - Map of workspace name to path
- * @param {Map<string, Promise<Set<string>>>} cache - Cache of package resolution promises
- * @returns {Promise<Set<string>>} Set of workspace package names (dependencies only, not including the package itself)
- */
-async function getWorkspaceDependenciesRecursive(packageName, workspaceMap, cache) {
-  // Check cache first
-  const cached = cache.get(packageName);
-  if (cached) {
-    return cached;
-  }
-
-  // Create the resolution promise
-  const promise = (async () => {
-    const packagePath = workspaceMap.get(packageName);
-    if (!packagePath) {
-      throw new Error(`Workspace "${packageName}" not found in the repository`);
-    }
-
-    const packageJsonPath = path.join(packagePath, 'package.json');
-    const content = await fs.readFile(packageJsonPath, 'utf8');
-    const packageJson = JSON.parse(content);
-
-    // Collect all dependency names
-    /** @type {Set<string>} */
-    const allDeps = new Set();
-    if (packageJson.dependencies) {
-      Object.keys(packageJson.dependencies).forEach((dep) => allDeps.add(dep));
-    }
-    if (packageJson.devDependencies) {
-      Object.keys(packageJson.devDependencies).forEach((dep) => allDeps.add(dep));
-    }
-    if (packageJson.peerDependencies) {
-      Object.keys(packageJson.peerDependencies).forEach((dep) => allDeps.add(dep));
-    }
-
-    // Filter to only workspace dependencies
-    const workspaceDeps = Array.from(allDeps).filter((dep) => workspaceMap.has(dep));
-
-    // Recursively process workspace dependencies in parallel
-    const recursiveResults = await Promise.all(
-      workspaceDeps.map(async (dep) => {
-        return getWorkspaceDependenciesRecursive(dep, workspaceMap, cache);
-      }),
-    );
-
-    // Merge all results using flatMap
-    return new Set(recursiveResults.flatMap((result) => Array.from(result)).concat(workspaceDeps));
-  })();
-
-  // Store in cache before returning
-  cache.set(packageName, promise);
-
-  return promise;
-}
-
-/**
- * Get transitive workspace dependencies for a list of workspace names
- * @param {string[]} workspaceNames - Array of workspace names
- * @param {Map<string, string>} workspaceMap - Map of workspace name to path
- * @returns {Promise<Set<string>>} Set of workspace package names (including requested packages and all their dependencies)
- */
-async function getTransitiveDependencies(workspaceNames, workspaceMap) {
-  // Shared cache for all workspace dependency resolution
-  const cache = new Map();
-
-  // Validate all workspace names exist
-  for (const workspaceName of workspaceNames) {
-    if (!workspaceMap.has(workspaceName)) {
-      throw new Error(`Workspace "${workspaceName}" not found in the repository`);
-    }
-  }
-
-  // Process each requested workspace in parallel
-  const workspaceResults = await Promise.all(
-    workspaceNames.map((workspaceName) =>
-      getWorkspaceDependenciesRecursive(workspaceName, workspaceMap, cache),
-    ),
-  );
-
-  // Merge all results using flatMap and add the original package names
-  return new Set(workspaceNames.concat(workspaceResults.flatMap((result) => Array.from(result))));
-}
-
-/**
- * Generate the ignore command string for netlify.toml
+ * Generate the ignore command string for netlify.toml.
+ *
+ * Production and branch deploys (every Netlify $CONTEXT other than
+ * "deploy-preview") always build, so downstream plugins (e.g. e2e triggers)
+ * run on every deploy and catch regressions in external dependencies even
+ * when the commit doesn't touch the watched paths.
+ *
+ * Only deploy-previews (PR previews) are eligible to be skipped: they diff
+ * against the merge-base with origin/<baseBranch>. This way a PR rebase whose
+ * head commit doesn't touch the watched paths still rebuilds when the PR as a
+ * whole introduces changes to them — otherwise downstream plugins silently
+ * never run.
+ *
  * @param {string[]} paths - Array of paths to include in the ignore command
  * @param {string} packagePath - Absolute path to the package directory
  * @param {string} workspaceRoot - Absolute path to the workspace root
+ * @param {string} baseBranch - Branch to compare PRs against
  * @returns {string} The ignore command string
  */
-function generateIgnoreCommand(paths, packagePath, workspaceRoot) {
+function generateIgnoreCommand(paths, packagePath, workspaceRoot, baseBranch) {
   const relFromBase = `${toPosixPath(path.relative(packagePath, workspaceRoot))}/`;
   const pathsStr = paths.join(' ');
-  return `  ignore = "cd ${relFromBase} && git diff --quiet $CACHED_COMMIT_REF $COMMIT_REF ${pathsStr}"`;
+  return `  ignore = """cd ${relFromBase} && [ "$CONTEXT" = "deploy-preview" ] && git fetch origin ${baseBranch} --depth=500 -q && git diff --quiet FETCH_HEAD...$COMMIT_REF -- ${pathsStr}"""`;
 }
 
 /**
@@ -180,6 +108,12 @@ export default /** @type {import('yargs').CommandModule<{}, Args>} */ ({
         default: false,
         describe: 'Check if the netlify.toml needs updating without modifying it',
       })
+      .option('base-branch', {
+        type: 'string',
+        default: 'master',
+        describe:
+          "Branch to compare PRs against (the site's production branch on Netlify). Production and branch deploys always rebuild regardless of this value.",
+      })
       .example('$0 netlify-ignore @mui/internal-docs-infra', 'Update netlify.toml for a workspace')
       .example(
         '$0 netlify-ignore @mui/internal-docs-infra @mui/internal-code-infra',
@@ -191,7 +125,7 @@ export default /** @type {import('yargs').CommandModule<{}, Args>} */ ({
       );
   },
   handler: async (argv) => {
-    const { workspaces, check = false } = argv;
+    const { workspaces, check = false, baseBranch = 'master' } = argv;
 
     // Get the workspace root
     const workspaceRoot = await findWorkspaceDir(process.cwd());
@@ -220,7 +154,9 @@ export default /** @type {import('yargs').CommandModule<{}, Args>} */ ({
         console.log(`Processing ${workspaceName}...`);
 
         // Get transitive dependencies for this specific workspace
-        const dependencyNames = await getTransitiveDependencies([workspaceName], workspaceMap);
+        const dependencyNames = await getTransitiveDependencies([workspaceName], {
+          workspacePathByName: workspaceMap,
+        });
 
         // Convert package names to relative paths (normalize to POSIX separators for git)
         const relativePaths = Array.from(dependencyNames)
@@ -241,7 +177,12 @@ export default /** @type {import('yargs').CommandModule<{}, Args>} */ ({
         const allPaths = [...relativePaths, 'pnpm-lock.yaml'];
 
         // Generate the ignore command for this workspace
-        const newIgnoreCommand = generateIgnoreCommand(allPaths, workspacePath, workspaceRoot);
+        const newIgnoreCommand = generateIgnoreCommand(
+          allPaths,
+          workspacePath,
+          workspaceRoot,
+          baseBranch,
+        );
 
         // Update or check the netlify.toml file
         await updateNetlifyToml(tomlPath, newIgnoreCommand, check);

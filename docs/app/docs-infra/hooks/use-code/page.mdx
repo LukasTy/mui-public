@@ -19,7 +19,7 @@ Key features include:
 
 ## Architecture
 
-The hook is built using a modular architecture with six specialized sub-hooks:
+The hook is built using a modular architecture with seven specialized sub-hooks:
 
 - **useVariantSelection**: Manages code variant selection and related data
 - **useTransformManagement**: Handles code transforms and their application
@@ -27,16 +27,16 @@ The hook is built using a modular architecture with six specialized sub-hooks:
 - **useUIState**: Controls UI state like expansion
 - **useCopyFunctionality**: Handles clipboard operations
 - **useSourceEditing**: Manages source code editing capabilities
+- **useSourceEnhancing**: Applies enhancer functions to parsed HAST sources
 
 ## Basic Usage
 
 ```tsx
-import { useCode } from '@mui/internal-docs-infra';
+import { useCode } from '@mui/internal-docs-infra/useCode';
 import type { ContentProps } from '@mui/internal-docs-infra/CodeHighlighter/types';
 
 function CodeContent(props: ContentProps<{}>) {
   const code = useCode(props, {
-    defaultOpen: true,
     initialVariant: 'TypeScript',
   });
 
@@ -45,7 +45,10 @@ function CodeContent(props: ContentProps<{}>) {
       <h3>{code.userProps.name}</h3>
       <div>
         Current: {code.selectedVariant}
-        <select value={code.selectedVariant} onChange={(e) => code.selectVariant(e.target.value)}>
+        <select
+          value={code.selectedVariant}
+          onChange={(event) => code.selectVariant(event.target.value)}
+        >
           {code.variants.map((variant) => (
             <option key={variant} value={variant}>
               {variant}
@@ -77,6 +80,28 @@ function CodeContent(props: ContentProps<{}>) {
 }
 ```
 
+When the code is rendered through a controller that supplies a `setSource` handler (see [`CodeControllerContext`](../../components/code-controller-context/page.mdx)), the `<Pre>` rendered by `code.selectedFile` adds a keyboard focus trap so that <kbd>Tab</kbd> through the page doesn't get caught by contentEditable's indent behavior. See [Editable Code Focus Trap](../../components/code-controller-context/page.mdx#editable-code-focus-trap) for the interaction details and the CSS hooks you can style.
+
+### Live editing is loaded on demand
+
+The heavy live-editing runtime — the `contentEditable` setup and the keystroke/caret/paste handling (the `EditableEngine` chunk, a few KB gzip, with `react-dom` left external) — is loaded **on demand**, so read-only code blocks never ship it. An editable block loads it once the block renders: an eager [`CodeProvider`](../../components/code-provider/page.mdx) bundles it for zero-latency editing, while [`CodeProviderLazy`](../../components/code-provider/page.mdx) (the general default) fetches it once per page (deduped), and `CodeHighlighter` preloads it as soon as it detects an editable `CodeControllerContext` (one that exposes `setCode`). Until the engine resolves, `contentEditable` is not applied — the block stays selectable, read-only text.
+
+Use the `editActivation` prop — set on [`CodeHighlighter`](../../components/code-highlighter/page.mdx) or, more commonly, on a demo created with the [demo factory](../../components/code-highlighter/page.mdx#demo-factory-pattern) — to defer the load until the reader actually engages the code:
+
+- `'eager'` (default) — load the engine as soon as the block is editable, and let `CodeHighlighter` speculatively preload it on first render.
+- `'interaction'` — warm the engine on hover (`pointerenter`) and commit (load + attach `contentEditable`) on focus or pointer down. The speculative preload is suppressed, so a block the reader never engages stays plain text and fetches nothing.
+
+```tsx
+// Editing activates only once the reader hovers, focuses, or clicks the code.
+<CodeHighlighter editActivation="interaction" {...props} />
+```
+
+A related nicety — **boundary auto-expand**: in a collapsed
+[collapsible block](../use-code-window/page.mdx), the caret respects the
+collapsed-frame boundaries while editing, and moving past them (e.g. pressing <kbd>↓</kbd>
+on the last visible line) automatically expands the block instead of stranding the
+caret in hidden lines.
+
 ## Types
 
 import { TypesUseCode } from './types';
@@ -86,6 +111,69 @@ import { TypesUseCode } from './types';
 [See Types](./types.md)
 
 ## Advanced Usage
+
+### Refreshing loaded data
+
+`useCode` (and `useDemo`) return a `refresh()` callback for re-fetching a block's
+source on the client — useful when the underlying code can change (live data, a
+just-saved file, a "reload" control):
+
+```tsx
+const { refresh, files, selectedFile } = useCode(contentProps);
+
+// e.g. a reload button
+<button type="button" onClick={() => refresh()}>
+  Reload
+</button>;
+```
+
+`refresh()` re-runs the **full** variant loader (`loadIsomorphicCodeVariant`),
+not the stripped initial-fallback loader, so every variant, transform, and extra
+file comes back fresh. It is **stale-while-revalidate**: the current highlighted
+output stays on screen until the new tree is ready (via the same deferred-highlight
+gate used for the first load), so there is no flash of unhighlighted or empty
+content. The per-file pre-parsed HAST cache is invalidated so the refreshed source
+re-highlights rather than reusing stale spans.
+
+It is a no-op when there is nothing to re-fetch — a block with no `url`, or one
+rendered without a [`CodeProvider`](../../components/code-provider/page.mdx). On
+the server `refresh` is `undefined`; it only does work on the client.
+
+### Copying Code — Plain Text and Markdown
+
+`useCode` returns two clipboard callbacks:
+
+- **`copy`** — copies the **selected file's** plain text.
+- **`copyMarkdown`** — copies the **entire variant** as a Markdown snippet: the
+  block's name as a heading, then one fenced code block per file with the
+  filename rendered as a comment in each language's syntax. Ready to paste into
+  an issue, a chat message, or an LLM prompt.
+
+```tsx
+function CopyControls(props) {
+  const code = useCode(props);
+
+  return (
+    <div>
+      <button onClick={code.copy}>Copy file</button>
+      <button onClick={code.copyMarkdown}>Copy as Markdown</button>
+      {code.selectedFile}
+    </div>
+  );
+}
+```
+
+Both are wired through [`useCopier`](../use-copier/page.mdx); pass the `copy`
+option (`UseCopierOpts`) to configure success-state timing and callbacks for
+both. Compressed sources are decoded back to text on demand, so neither copy
+forces an early decompression of the block.
+
+> [!NOTE]
+> For lists and standalone chunks, the lower-level
+> [`CoordinatedLazy`](../../components/coordinated-lazy/page.mdx) /
+> [`useStream`](../use-stream/page.mdx) primitives expose the same `refresh()`
+> plus an opt-in `revalidateOnIdle` that automatically revalidates once the
+> browser goes idle after the initial load.
 
 ### URL Management and File Navigation
 
@@ -282,7 +370,7 @@ function TransformSelector(props) {
       {code.availableTransforms.length > 0 && (
         <select
           value={code.selectedTransform || ''}
-          onChange={(e) => code.selectTransform(e.target.value || null)}
+          onChange={(event) => code.selectTransform(event.target.value || null)}
         >
           <option value="">No Transform</option>
           {code.availableTransforms.map((transform) => (
@@ -362,8 +450,8 @@ function CodeWithTabs(props) {
               <a
                 key={file.name}
                 href={`#${file.slug}`}
-                onClick={(e) => {
-                  e.preventDefault();
+                onClick={(event) => {
+                  event.preventDefault();
                   code.selectFileName(file.name);
                 }}
                 className={`${styles.tab} ${
@@ -435,7 +523,7 @@ The hook generates URL hashes for file navigation following these patterns:
 
 When the variant name is "Default", it's omitted from the hash:
 
-```
+```text
 #mainSlug:fileName
 # Examples:
 #button-demo:button.tsx
@@ -447,7 +535,7 @@ When the variant name is "Default", it's omitted from the hash:
 
 All other variants include the variant name in the hash:
 
-```
+```text
 #mainSlug:variantName:fileName
 # Examples:
 #button-demo:tailwind:button.tsx
@@ -459,7 +547,7 @@ All other variants include the variant name in the hash:
 
 Variants (except "Default") can also be referenced without a filename:
 
-```
+```text
 #mainSlug:variantName
 # Examples:
 #button-demo:tailwind
@@ -532,6 +620,7 @@ Manages file selection and navigation within code variants. Features:
 - Hash removal behavior controlled by `fileHashMode`
 - Cross-variant file navigation
 - Detection of user-initiated vs. hash-driven variant changes
+- Derivation of `selectedFileUrl` by resolving the selected file's name (or its `relativeUrl`) against the variant's `url`. Available on the `useCode` result so consumers can link back to the source file (e.g., for an "Edit on GitHub" link).
 
 The hook generates slugs for all files across all variants, with special handling for the "Default" variant (which omits the variant name from the hash).
 
@@ -560,7 +649,7 @@ Enhancers can be passed to either:
 - **`CodeHighlighter`** component via the `sourceEnhancers` prop (runs on server or during hydration)
 - **`useCode`** hook via the `sourceEnhancers` option (runs on client after hydration)
 
-### Basic Usage
+### Enhancer Basic Usage
 
 ```tsx
 import type { SourceEnhancer, HastRoot } from '@mui/internal-docs-infra/CodeHighlighter/types';
@@ -652,7 +741,7 @@ const commentHighlighter: SourceEnhancer = (root, comments, fileName) => {
 
   // Use comments to add highlighting or annotations
   // comments structure: Record<number, string[]>
-  // where key is line number, value is array of comments on that line
+  // where key is the 1-indexed line number, value is array of comments on that line
   return processCommentsIntoHighlights(root, comments);
 };
 ```
@@ -721,7 +810,7 @@ function MyCodeContent(props) {
 Enhancers and transformers serve different purposes and operate at different stages:
 
 | Aspect                | Enhancers                                        | Transformers                         |
-| --------------------- | ------------------------------------------------ | ------------------------------------ |
+| :-------------------- | :----------------------------------------------- | :----------------------------------- |
 | **Purpose**           | Add visual annotations to HAST                   | Modify the source code itself        |
 | **Operates on**       | HAST (parsed syntax tree)                        | Plain text source code               |
 | **Stage**             | After parsing, in `CodeHighlighter` or `useCode` | Before parsing, in `CodeHighlighter` |
@@ -837,7 +926,7 @@ function SafeCodeInterface(props) {
   const code = useCode(props);
 
   if (!code.selectedFile) {
-    return <div>Loading code...</div>;
+    return <div>Loading code…</div>;
   }
 
   return <div>{code.selectedFile}</div>;
@@ -848,11 +937,15 @@ function SafeCodeInterface(props) {
 
 ```tsx
 const code = useCode(props, {
-  defaultOpen: true, // Start expanded
   initialVariant: 'TypeScript', // Pre-select variant
   initialTransform: 'js', // Pre-apply transform
 });
 ```
+
+Whether the block starts expanded is **not** a `useCode` option — it's
+`initialExpanded`, set on `contentProps` (via `<CodeHighlighter initialExpanded />`,
+`createDemo(..., { initialExpanded: true })`, or `<Demo initialExpanded />`). It
+lives there rather than in `useCode` opts so the loading fallback honors it too.
 
 ## Performance Considerations
 
@@ -876,6 +969,18 @@ Errors are logged to the console and the hook gracefully degrades functionality 
 
 - **[useDemo](../use-demo/page.mdx)**: For managing component rendering alongside code display - use this when you need both code and component functionality
 - **[CodeHighlighter](../../components/code-highlighter/page.mdx)**: The main component this hook is designed to work with
+
+export const metadata =
+  /** @type {import('@mui/internal-docs-infra/createSitemap/types').NextMetadata} */ ({
+    keywords: [
+      'file navigation',
+      'deep linking',
+      'URL hash',
+      'transforms',
+      'source enhancers',
+      'copy code',
+    ],
+  });
 
 ## Troubleshooting
 

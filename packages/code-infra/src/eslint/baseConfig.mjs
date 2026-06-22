@@ -6,6 +6,7 @@ import compatPlugin from 'eslint-plugin-compat';
 import importPlugin from 'eslint-plugin-import';
 import jsxA11yPlugin from 'eslint-plugin-jsx-a11y';
 import reactPlugin from 'eslint-plugin-react';
+import * as mdx from 'eslint-plugin-mdx';
 import { configs as reactCompilerPluginConfigs } from 'eslint-plugin-react-compiler';
 import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
@@ -34,19 +35,60 @@ function includeIgnoreIfExists(filePath, description) {
  * @param {boolean} [params.consistentTypeImports] - Whether to enforce consistent type imports.
  * @param {boolean} [params.materialUi] - Whether to enable Material UI specific rules (mui/material-ui-*).
  * @param {string} [params.baseDirectory] - The base directory for the configuration.
+ * @param {boolean} [params.markdown] - @deprecated Markdown/MDX linting is enabled by default; this option no longer needs to be passed. To skip markdown linting, use eslint ignore patterns for the relevant files.
  * @returns {import('eslint').Linter.Config[]}
  */
 export function createBaseConfig({
   enableReactCompiler = false,
   consistentTypeImports = false,
   materialUi = false,
+  markdown = true,
   baseDirectory = process.cwd(),
 } = {}) {
   return defineConfig([
+    {
+      name: 'settings',
+      languageOptions: {
+        ecmaVersion: 7,
+        globals: {
+          ...globals.es2020,
+          ...globals.browser,
+          ...globals.node,
+        },
+      },
+      plugins: {
+        mui: muiPlugin,
+      },
+      settings: {
+        react: {
+          version: 'detect',
+        },
+        browserslistOpts: {
+          config: path.join(baseDirectory, '.browserslistrc'),
+          env: 'stable',
+          ignoreUnknownVersions: true,
+        },
+      },
+    },
     includeIgnoreIfExists(path.join(baseDirectory, '.gitignore'), `Ignore rules from .gitignore`),
     includeIgnoreIfExists(path.join(baseDirectory, '.lintignore'), `Ignore rules from .lintignore`),
     createJsonConfig(),
     prettier,
+    // Markdown + MDX linting via eslint-plugin-mdx. Severities for markdown
+    // quality checks live in the project's `.remarkrc` (see
+    // `@mui/internal-code-infra/remark`), not here.
+    markdown
+      ? [
+          {
+            ...mdx.flat,
+            rules: {
+              ...mdx.flat.rules,
+              'mdx/remark': 'error',
+            },
+          },
+          mdx.flatCodeBlocks,
+        ]
+      : [],
     {
       name: 'Base config',
       files: [`**/*${EXTENSION_TS}`],
@@ -62,25 +104,7 @@ export function createBaseConfig({
         enableReactCompiler ? reactCompilerPluginConfigs.recommended : {},
         compatPlugin.configs['flat/recommended'],
         {
-          name: 'typescript-eslint-parser',
-          languageOptions: {
-            ecmaVersion: 7,
-            globals: {
-              ...globals.es2020,
-              ...globals.browser,
-              ...globals.node,
-            },
-          },
-          plugins: {
-            mui: muiPlugin,
-          },
-          settings: {
-            browserslistOpts: {
-              config: path.join(baseDirectory, '.browserslistrc'),
-              env: 'stable',
-              ignoreUnknownVersions: true,
-            },
-          },
+          name: 'core',
           extends: createCoreConfig({ enableReactCompiler, consistentTypeImports, materialUi }),
         },
         // Lint rule to disallow usage of typescript namespaces.We've seen at least two problems with them:
@@ -114,6 +138,14 @@ export function createBaseConfig({
             'no-useless-assignment': 'off',
             // Disallows unused vars without explicit init (use @typescript-eslint/no-unused-vars instead)
             'no-unassigned-vars': 'off',
+          },
+        },
+        // @TODO: Remove this once @typescript-eslint/no-shadow supports wrapped functions
+        //   See https://github.com/eslint/eslint/pull/20982 (once merged also needs port to `typescript-eslint`)
+        {
+          name: 'Disabled tseslint-plugins',
+          rules: {
+            '@typescript-eslint/no-shadow': 'off',
           },
         },
       ]),

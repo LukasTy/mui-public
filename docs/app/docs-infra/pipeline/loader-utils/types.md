@@ -80,6 +80,27 @@ A portable path starting with `/` that works with path-module
 type ReturnValue = string;
 ```
 
+### generateFileSlug
+
+Generates a file slug based on main slug, file name, and variant name
+All variants except "Default" include the variant name in the hash
+
+**Parameters:**
+
+| Parameter   | Type     | Default | Description                  |
+| :---------- | :------- | :------ | :--------------------------- |
+| mainSlug    | `string` | -       | The main component/demo slug |
+| fileName    | `string` | -       | The file name                |
+| variantName | `string` | -       | The variant name             |
+
+**Return Value:**
+
+Generated file slug
+
+```tsx
+type ReturnValue = string;
+```
+
 ### getFileNameFromUrl
 
 Extracts the filename and extension from a URL or file path.
@@ -170,17 +191,20 @@ to correctly identify imports while avoiding false positives in strings, comment
 and template literals, it's most efficient to handle comment processing in this
 same pass rather than requiring separate parsing steps.
 
-The function accepts file:// URLs or file paths and converts them internally to a
-portable path format that works cross-platform. Resolved import paths are returned
-in the same portable format (forward slashes, starting with /).
+The function accepts file:// URLs, http(s):// URLs, or file paths. File URLs
+and OS paths are normalized to a portable POSIX-style path internally and
+resolved via `path.resolve`. http(s):// URLs are preserved verbatim and
+relative imports are resolved via WHATWG `URL`, which means demos can be
+parsed straight out of remote sources without first being mapped onto a
+placeholder `file://` URL.
 
 **Parameters:**
 
-| Parameter | Type                                                                        | Default | Description                                                                                       |
-| :-------- | :-------------------------------------------------------------------------- | :------ | :------------------------------------------------------------------------------------------------ |
-| code      | `string`                                                                    | -       | The source code to parse                                                                          |
-| fileUrl   | `string`                                                                    | -       | The file URL (file:// protocol) or path, used to determine file type and resolve relative imports |
-| options?  | `{ removeCommentsWithPrefix?: string[]; notableCommentsPrefix?: string[] }` | -       | Optional configuration for comment processing                                                     |
+| Parameter | Type                                                                        | Default | Description                                                                                                       |
+| :-------- | :-------------------------------------------------------------------------- | :------ | :---------------------------------------------------------------------------------------------------------------- |
+| code      | `string`                                                                    | -       | The source code to parse                                                                                          |
+| fileUrl   | `string`                                                                    | -       | The file URL (`file://`, `http://`, `https://`) or path, used to determine file type and resolve relative imports |
+| options?  | `{ removeCommentsWithPrefix?: string[]; notableCommentsPrefix?: string[] }` | -       | Optional configuration for comment processing                                                                     |
 
 **Return Value:**
 
@@ -465,7 +489,11 @@ type ImportsAndComments = {
   externals: Record<string, ExternalImport>;
   /** The processed code with comments removed (if comment processing was requested) */
   code?: string;
-  /** Map of line numbers to arrays of comment content (if comment processing was requested) */
+  /**
+   * Map of 1-indexed output line numbers (in `code`, after comment removal) to arrays of
+   * comment content (if comment processing was requested). 1-indexed is the canonical
+   * `Code` convention, matching the HAST `dataLn` gutter the enhancers read.
+   */
   comments?: Record<number, string[]>;
 };
 ```
